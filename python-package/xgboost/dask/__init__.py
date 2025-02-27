@@ -145,6 +145,52 @@ __all__ = [
     "inplace_predict",
 ]
 
+
+T = TypeVar("T", da.Array, dd.DataFrame)
+
+
+def _persist_collections(*collections: Sequence[T], client: distributed.Client):
+    """
+    Evenly persist multiple collections on workers.
+
+    This assumes / requires that the collections all have similar chunking.
+    Array should be chunked only along the first dimension.
+    """
+    if not len(collections):
+        raise ValueError
+
+    t0 = collections[0]
+    workers = client.scheduler_info()["workers"]
+
+    match t0:
+        case da.Array():
+            length = collections[0].blocks.shape[0] // len(workers)
+        case dd.DataFrame() | dd.Series():
+            length = collections[0].npartitions // len(workers)
+        case _:
+            raise ValueError(t0)
+
+    slices = [slice(length * i, length * (i + 1)) for i in range(len(workers))]
+    slices[-1] = slice(slices[0].start, None)
+
+    collections_per_worker = []
+
+    for slice_ in slices:
+        x = []
+        for collection in collections:
+            if isinstance(collection, da.Array):
+                x.append(collection.blocks[slice_])
+            else:
+                x.append(collection.partitions[slice_])
+        collections_per_worker.append(x)
+
+    futures = {}
+    for worker, worker_collections in zip(workers, collections_per_worker):
+        futures[worker] = client.futures_of(client.persist(worker_collections, workers=[worker]))
+
+    return futures
+
+
 # TODOs:
 #   - CV
 #
@@ -397,7 +443,7 @@ class DaskDMatrix:
 
             """
             d = client.persist(d)
-            delayed_obj = d.to_delayed()
+            delayed_obj = d.to_delayed(optimize_graph=False)
             if isinstance(delayed_obj, numpy.ndarray):
                 # da.Array returns an array to delayed objects
                 check_columns(delayed_obj)
